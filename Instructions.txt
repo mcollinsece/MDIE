@@ -1,0 +1,6 @@
+Some env variables needed for the lambda function are:
+DISABLE_SAGEMAKER = true
+DYNAMODB_TABLE_NAME = name_of_table
+OUTPUT_BUCKET_NAME = output_bucket
+PATH = $PATH:/opt/imagemagick/bin
+SAGEMAKER_ENDPOINT_NAME = does_work_but_not_usable
