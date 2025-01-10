@@ -1,4 +1,4 @@
-FROM python:3.12
+FROM python:3.12-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -8,13 +8,21 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python dependencies
+# Copy requirements file
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
 
-# Run the application
-CMD ["python", "your_script.py"]
+# Create directory for temporary files
+RUN mkdir -p /tmp/dicom
 
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV TMP_DIR=/tmp/dicom
+
+# Run the application
+CMD ["python", "dicom_processor.py"]
