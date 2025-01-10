@@ -8,59 +8,205 @@ import sys
 import json
 import logging
 import pydicom
+import time
+from botocore.exceptions import ClientError
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Initialize AWS clients
-sagemaker = boto3.client('sagemaker-runtime')
-s3 = boto3.client('s3')
-dynamodb = boto3.resource('dynamodb')
+class DicomProcessor:
+    def __init__(self):
+        # Initialize AWS clients
+        self.sagemaker = boto3.client('sagemaker-runtime')
+        self.s3 = boto3.client('s3')
+        self.dynamodb = boto3.resource('dynamodb')
+        
+        # Get environment variables with defaults
+        self.dynamodb_table_name = os.environ.get('DYNAMODB_TABLE_NAME', 'default_table_name')
+        self.endpoint_name = os.environ.get('SAGEMAKER_ENDPOINT_NAME', 'default_endpoint')
+        self.input_bucket = os.environ.get('INPUT_BUCKET_NAME')
+        self.output_bucket = os.environ.get('OUTPUT_BUCKET_NAME')
+        self.tmp_dir = os.environ.get('TMP_DIR', '/tmp')
+        self.disable_sagemaker = os.environ.get('DISABLE_SAGEMAKER', 'false').lower() == 'true'
+        self.poll_interval = int(os.environ.get('POLL_INTERVAL_SECONDS', '60'))
+        
+        # Ensure temporary directory exists
+        os.makedirs(self.tmp_dir, exist_ok=True)
+        
+        # Initialize DynamoDB table
+        self.table = self.dynamodb.Table(self.dynamodb_table_name)
 
-# Get environment variables with defaults
-dynamodb_table_name = os.environ.get('DYNAMODB_TABLE_NAME', 'default_table_name')
-endpoint_name = os.environ.get('SAGEMAKER_ENDPOINT_NAME', 'default_endpoint')
-output_bucket_name = os.environ.get('OUTPUT_BUCKET_NAME')
-tmp_dir = os.environ.get('TMP_DIR', '/tmp')
-disable_sagemaker = os.environ.get('DISABLE_SAGEMAKER', 'false').lower() == 'true'
-
-def process_file(input_bucket_name, file_key):
-    # Your existing processing logic here
-    dest_folder_name = uuid.uuid4()
-    # ... rest of your processing logic ...
-
-def cleanup_temp_files(temp_dir):
-    for file in glob.glob(os.path.join(temp_dir, '*')):
+    def health_check(self):
+        """Verify connections to required AWS services"""
         try:
-            os.remove(file)
+            self.s3.list_buckets()
+            self.table.get_item(Key={'uuid': 'health_check'})
+            if not self.disable_sagemaker:
+                # Just check if endpoint exists
+                self.sagemaker.list_endpoints(NameContains=self.endpoint_name)
+            return True
         except Exception as e:
-            logger.error(f"Error cleaning up {file}: {e}")
+            logger.error(f"Health check failed: {e}")
+            return False
 
-def health_check():
-    try:
-        s3.list_buckets()
-        dynamodb.Table(dynamodb_table_name).get_item(Key={'uuid': 'test'})
-        return True
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return False
+    def cleanup_temp_files(self):
+        """Remove all files from temporary directory"""
+        try:
+            files = glob.glob(os.path.join(self.tmp_dir, '*'))
+            for file in files:
+                os.remove(file)
+                logger.debug(f"Removed temporary file: {file}")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+
+    def process_dicom_file(self, file_key):
+        """Process a single DICOM file"""
+        dest_folder_name = str(uuid.uuid4())
+        dicom_file = os.path.join(self.tmp_dir, 'dicom_file.dcm')
+        
+        try:
+            # Download DICOM file from S3
+            logger.info(f"Downloading {file_key} from {self.input_bucket}")
+            self.s3.download_file(self.input_bucket, file_key, dicom_file)
+
+            # Convert DICOM to PNG
+            logger.info(f"Converting {dicom_file} to PNG")
+            subprocess.run(['mogrify', '-format', 'png', dicom_file], 
+                         check=True, 
+                         capture_output=True)
+
+            # Get list of generated PNG files
+            image_files = [os.path.join(self.tmp_dir, f) 
+                         for f in os.listdir(self.tmp_dir) 
+                         if f.endswith('.png')]
+            num_png_files = len(image_files)
+
+            if num_png_files == 0:
+                raise Exception("No PNG files were generated from DICOM")
+
+            # Read DICOM metadata
+            dicom_data = pydicom.dcmread(dicom_file)
+            
+            metadata = {
+                'modality': getattr(dicom_data, 'Modality', 'Unknown'),
+                'patient_id': getattr(dicom_data, 'PatientID', 'Unknown'),
+                'study_date': getattr(dicom_data, 'StudyDate', 'Unknown'),
+                'study_description': getattr(dicom_data, 'StudyDescription', 'Unknown'),
+                'series_description': getattr(dicom_data, 'SeriesDescription', 'Unknown')
+            }
+
+            # Process images through SageMaker if enabled
+            responses = []
+            if not self.disable_sagemaker:
+                logger.info(f"Calling SageMaker endpoint: {self.endpoint_name}")
+                for image_file in image_files:
+                    with open(image_file, 'rb') as f:
+                        image_data = f.read()
+                    response = self.sagemaker.invoke_endpoint(
+                        EndpointName=self.endpoint_name,
+                        ContentType='application/x-image',
+                        Body=image_data
+                    )
+                    responses.append(response)
+
+            # Store results in DynamoDB
+            self.table.put_item(
+                Item={
+                    'uuid': dest_folder_name,
+                    'num_png_files': num_png_files,
+                    'timestamp': str(datetime.now()),
+                    **metadata,
+                    'sagemaker_response': responses,
+                    'source_file': file_key
+                }
+            )
+
+            # Upload PNG files to output bucket
+            for image_file in image_files:
+                png_key = f"{dest_folder_name}/{os.path.basename(image_file)}"
+                logger.info(f"Uploading {png_key} to {self.output_bucket}")
+                self.s3.upload_file(image_file, self.output_bucket, png_key)
+
+            # Delete processed file from input bucket
+            self.s3.delete_object(Bucket=self.input_bucket, Key=file_key)
+            logger.info(f"Successfully processed {file_key}")
+
+        except Exception as e:
+            logger.error(f"Error processing {file_key}: {e}", exc_info=True)
+            raise
+        finally:
+            self.cleanup_temp_files()
+
+    def get_pending_files(self):
+        """Get list of DICOM files waiting to be processed"""
+        try:
+            response = self.s3.list_objects_v2(
+                Bucket=self.input_bucket,
+                Prefix='',
+                MaxKeys=10  # Process in batches
+            )
+            return [obj['Key'] for obj in response.get('Contents', [])
+                   if obj['Key'].lower().endswith('.dcm')]
+        except Exception as e:
+            logger.error(f"Error listing files in {self.input_bucket}: {e}")
+            return []
+
+    def validate_environment(self):
+        """Validate required environment variables and permissions"""
+        required_vars = ['INPUT_BUCKET_NAME', 'OUTPUT_BUCKET_NAME', 'DYNAMODB_TABLE_NAME']
+        missing_vars = [var for var in required_vars if not os.environ.get(var)]
+        
+        if missing_vars:
+            raise EnvironmentError(
+                f"Missing required environment variables: {', '.join(missing_vars)}"
+            )
+        
+        if not self.disable_sagemaker and not self.endpoint_name:
+            raise EnvironmentError("SAGEMAKER_ENDPOINT_NAME is required when SageMaker is enabled")
+
+    def run(self):
+        """Main processing loop"""
+        logger.info("Starting DICOM processor")
+        
+        try:
+            self.validate_environment()
+        except EnvironmentError as e:
+            logger.error(f"Environment validation failed: {e}")
+            sys.exit(1)
+
+        if not self.health_check():
+            logger.error("Initial health check failed")
+            sys.exit(1)
+
+        logger.info("Initial health check passed, starting main loop")
+
+        while True:
+            try:
+                pending_files = self.get_pending_files()
+                
+                if not pending_files:
+                    logger.info("No files to process, waiting...")
+                    time.sleep(self.poll_interval)
+                    continue
+
+                for file_key in pending_files:
+                    try:
+                        self.process_dicom_file(file_key)
+                    except Exception as e:
+                        logger.error(f"Failed to process {file_key}: {e}")
+                        continue
+
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                time.sleep(self.poll_interval)  # Wait before retrying
 
 def main():
-    # Ensure temp directory exists
-    os.makedirs(tmp_dir, exist_ok=True)
-    
-    # Add your main processing loop here
-    # This could be polling an SQS queue, watching a directory, etc.
-    while True:
-        try:
-            # Your main processing logic here
-            # Example: poll for new files to process
-            pass
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=True)
-        finally:
-            cleanup_temp_files(tmp_dir)
+    processor = DicomProcessor()
+    processor.run()
 
 if __name__ == "__main__":
     main()
-
