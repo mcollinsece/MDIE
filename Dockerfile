@@ -1,9 +1,8 @@
-FROM python:3.12-slim
+FROM python:3.12-alpine
+
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
-    imagemagick \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache imagemagick
 
 # Set working directory
 WORKDIR /app
@@ -24,5 +23,6 @@ RUN mkdir -p /tmp/dicom
 ENV PYTHONUNBUFFERED=1
 ENV TMP_DIR=/tmp/dicom
 
+ENTRYPOINT ["/usr/local/bin/python3"]
 # Run the application
-CMD ["python3", "dicom_processor.py"]
+CMD ["dicom_processor.py"]
