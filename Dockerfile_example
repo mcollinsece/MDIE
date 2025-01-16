@@ -25,4 +25,4 @@ ENV PYTHONUNBUFFERED=1
 ENV TMP_DIR=/tmp/dicom
 
 # Run the application
-CMD ["python", "dicom_processor.py"]
+CMD ["python3", "dicom_processor.py"]
