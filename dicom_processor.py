@@ -1,113 +1,108 @@
 import os
-import subprocess
-import glob
-import boto3
-import uuid
-from datetime import datetime
 import sys
-sys.path.insert(0, '/opt/pydicom')
-import json
+import boto3
 import pydicom
+import numpy as np
+from PIL import Image
+import logging
+from botocore.exceptions import ClientError
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-sagemaker = boto3.client('sagemaker-runtime')
-s3 = boto3.client('s3')
-dynamodb = boto3.resource('dynamodb')
-dynamodb_table_name = os.environ.get('DYNAMODB_TABLE_NAME')
-table = dynamodb.Table(dynamodb_table_name)
+class DicomConverter:
+    def __init__(self):
+        self.s3_client = boto3.client('s3')
+        self.input_bucket = os.environ['INPUT_BUCKET']
+        self.input_key = os.environ['INPUT_KEY']
+        self.output_bucket = os.environ['OUTPUT_BUCKET']
+        self.local_input = '/data/input/dicom_file'
+        self.local_output = '/data/output'
 
-endpoint_name = os.environ.get('SAGEMAKER_ENDPOINT_NAME')
-disable_sagemaker = os.environ.get('DISABLE_SAGEMAKER', 'false').lower() == 'true'
-tmp_dir = os.environ.get('TMP_DIR')
-
-
-def lambda_handler(event, context):
-    print("Received event:", event)
-    print("Received context:", context)
-
-    input_bucket_name = event['Records'][0]['s3']['bucket']['name']
-    file_key = event['Records'][0]['s3']['object']['key']
-    output_bucket_name = os.environ.get('OUTPUT_BUCKET_NAME')
-    if not output_bucket_name:
-        print("Output bucket name not provided")
-        return {
-            'statusCode': 500,
-            'body': 'Output bucket name not provided'
-        }
-    print(f"Destination bucket: {output_bucket_name}")
-
-    # Need a uuid for tracking and uniqueness
-    dest_folder_name = uuid.uuid4()
-
-    # Download the DICOM file from S3
-    dicom_file = os.path.join(tmp_dir, 'dicom_file.dcm')
-    s3.download_file(input_bucket_name, file_key, dicom_file)
-
-    # Convert the DICOM file to PNG using mogrify
-    try:
-        print(f"Processing {dicom_file}")
-        subprocess.run(['mogrify', '-format', 'png', dicom_file], check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Error converting DICOM to PNG")
-        return
-
-    # What is the list of png files that were produced
-    image_files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir) if f.endswith('.png')]
-    num_png_files = len(image_files)
-
-    print(f"Files in the {tmp_dir}: {os.listdir(tmp_dir)}")
-
-    # Read DICOM metadata
-    dicom_data = pydicom.dcmread(dicom_file)
-
-    modality = 'Unknown' if not hasattr(dicom_data, 'Modality') else dicom_data.Modality
-    patient_id = 'Unknown' if not hasattr(dicom_data, 'PatientID') else dicom_data.PatientID
-    study_date = 'Unknown' if not hasattr(dicom_data, 'StudyDate') else dicom_data.StudyDate
-    study_description = 'Unknown' if not hasattr(dicom_data, 'StudyDescription') else dicom_data.StudyDescription
-    series_description = 'Unknown' if not hasattr(dicom_data, 'SeriesDescription') else dicom_data.SeriesDescription
-
-    print(f"Modality: {modality}")
-    print(f"Patient ID: {patient_id}")
-    print(f"Study Date: {study_date}")
-    print(f"Study Description: {study_description}")
-    print(f"Series Description: {series_description}")
-
-# call endpoint for each image file
-    responses = []
-    if not disable_sagemaker:
-        print("Calling SageMaker endpoint")
-        print(f"Endpoint name: {endpoint_name}")
-        for image_file in image_files:
-            with open(image_file, 'rb') as f:
-                image_data = f.read()
-            response = sagemaker.invoke_endpoint(
-                EndpointName=endpoint_name,
-                ContentType='application/x-image',
-                Body=image_data
+    def download_dicom(self):
+        """Download DICOM file from S3"""
+        try:
+            logger.info(f"Downloading DICOM from s3://{self.input_bucket}/{self.input_key}")
+            self.s3_client.download_file(
+                self.input_bucket,
+                self.input_key,
+                self.local_input
             )
-            responses.append(response)
-    else:
-        print("SageMaker inference is disabled")
-    
+        except ClientError as e:
+            logger.error(f"Error downloading DICOM: {e}")
+            raise
 
-    # Store the UUID, number of PNG files, DICOM metadata, and object detection results in DynamoDB
-    table.put_item(
-        Item={
-            'uuid': str(dest_folder_name),
-            'num_png_files': num_png_files,
-            'timestamp': str(datetime.now()),
-            'modality': modality,
-            'patient_id': patient_id,
-            'study_date': study_date,
-            'study_description': study_description,
-            'series_description': series_description,
-            'sagemaker_response': responses
-        }
-    )
+    def convert_to_layers(self):
+        """Convert DICOM to image layers"""
+        try:
+            # Read DICOM file
+            ds = pydicom.dcmread(self.local_input)
+            
+            # Get pixel array
+            pixel_array = ds.pixel_array
+            
+            # Process each layer
+            output_files = []
+            for i in range(pixel_array.shape[0]):
+                # Convert to 8-bit image
+                layer = pixel_array[i].astype(float)
+                layer = ((layer - layer.min()) / (layer.max() - layer.min()) * 255).astype(np.uint8)
+                
+                # Create PIL Image
+                img = Image.fromarray(layer)
+                
+                # Save layer
+                output_path = f"{self.local_output}/layer_{i:04d}.png"
+                img.save(output_path)
+                output_files.append(output_path)
+                
+            return output_files
+            
+        except Exception as e:
+            logger.error(f"Error converting DICOM: {e}")
+            raise
 
-    # Upload the PNG files to the output S3 bucket
-    for image_file in image_files:
-        png_key = os.path.join(str(dest_folder_name), os.path.basename(image_file))
-        s3.upload_file(image_file, output_bucket_name, png_key)
+    def upload_layers(self, output_files):
+        """Upload converted layers to S3"""
+        try:
+            output_prefix = f"{os.path.splitext(self.input_key)[0]}/layers"
+            
+            for file_path in output_files:
+                file_name = os.path.basename(file_path)
+                output_key = f"{output_prefix}/{file_name}"
+                
+                logger.info(f"Uploading {file_name} to s3://{self.output_bucket}/{output_key}")
+                self.s3_client.upload_file(
+                    file_path,
+                    self.output_bucket,
+                    output_key
+                )
+            
+            return output_prefix
+            
+        except ClientError as e:
+            logger.error(f"Error uploading layers: {e}")
+            raise
 
-    print(f"Successfully processed {file_key}")
+    def process(self):
+        """Main processing function"""
+        try:
+            self.download_dicom()
+            output_files = self.convert_to_layers()
+            output_prefix = self.upload_layers(output_files)
+            
+            return {
+                "OutputPrefix": output_prefix,
+                "LayerCount": len(output_files)
+            }
+            
+        except Exception as e:
+            logger.error(f"Processing failed: {e}")
+            sys.exit(1)
+
+if __name__ == "__main__":
+    converter = DicomConverter()
+    result = converter.process()
+    logger.info(f"Processing complete: {result}")
+
