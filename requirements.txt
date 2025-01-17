@@ -1,2 +1,4 @@
 pydicom>=2.3.0
 boto3>=1.34.0
+numpy>=2.2.1
+pillow>=11.1.0

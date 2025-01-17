@@ -14,11 +14,11 @@ logger = logging.getLogger(__name__)
 class DicomConverter:
     def __init__(self):
         self.s3_client = boto3.client('s3')
-        self.input_bucket = os.environ['INPUT_BUCKET']
+        self.input_bucket = os.environ['INPUT_BUCKET_NAME']
         self.input_key = os.environ['INPUT_KEY']
-        self.output_bucket = os.environ['OUTPUT_BUCKET']
-        self.local_input = '/data/input/dicom_file'
-        self.local_output = '/data/output'
+        self.output_bucket = os.environ['OUTPUT_BUCKET_NAME']
+        self.local_input = '/tmp/dicom_file'
+        self.local_output = '/tmp/'
 
     def download_dicom(self):
         """Download DICOM file from S3"""
@@ -102,6 +102,7 @@ class DicomConverter:
             sys.exit(1)
 
 if __name__ == "__main__":
+    print(os.environ)
     converter = DicomConverter()
     result = converter.process()
     logger.info(f"Processing complete: {result}")
