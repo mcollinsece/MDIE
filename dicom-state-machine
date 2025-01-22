@@ -26,7 +26,7 @@
       "Resource": "arn:aws:states:::ecs:runTask.sync",
       "Parameters": {
         "LaunchType": "FARGATE",
-        "TaskDefinition.$": "$.config.Parameters[?(@.Name == '/dicom/tasks/dicom-converter-task')].Value[0]",
+        "TaskDefinition.$": "States.StringAt($.config.Parameters[?(@.Name == '/dicom/tasks/dicom-converter-task')].Value, '[0]')",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
             "Subnets.$": "$.config.Parameters[?(@.Name == '/dicom/network/subnet-ids')].Value[0]",
