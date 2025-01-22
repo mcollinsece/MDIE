@@ -3,20 +3,75 @@
   "StartAt": "Get Configuration",
   "States": {
     "Get Configuration": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameters",
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "Get Network Params",
+          "States": {
+            "Get Network Params": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getParameters",
+              "Parameters": {
+                "Names": [
+                  "/dicom/network/subnet-ids",
+                  "/dicom/network/security-group-id"
+                ],
+                "WithDecryption": true
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Get Task Params",
+          "States": {
+            "Get Task Params": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getParameters",
+              "Parameters": {
+                "Names": [
+                  "/dicom/tasks/dicom-converter-container",
+                  "/dicom/tasks/dicom-converter-task",
+                  "/dicom/tasks/bedrock-inference-container",
+                  "/dicom/tasks/bedrock-inference-task",
+                  "/dicom/tasks/dicom-converter-cluster"
+                ],
+                "WithDecryption": true
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Get Storage and Function Params",
+          "States": {
+            "Get Storage and Function Params": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:getParameters",
+              "Parameters": {
+                "Names": [
+                  "/dicom/storage/output-bucket",
+                  "/dicom/storage/inference-output-bucket",
+                  "/dicom/functions/layer-count-function",
+                  "/dicom/functions/aggregate-results-function"
+                ],
+                "WithDecryption": true
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.config",
+      "ResultSelector": {
+        "Parameters.$": "$[*].Parameters[*]"
+      },
+      "Next": "Merge Parameters"
+    },
+    "Merge Parameters": {
+      "Type": "Pass",
       "Parameters": {
-        "Names": [
-          "/dicom/network/subnet-ids",
-          "/dicom/network/security-group-id",
-          "/dicom/tasks/dicom-converter-task",
-          "/dicom/tasks/bedrock-inference-task",
-          "/dicom/storage/output-bucket",
-          "/dicom/storage/inference-output-bucket",
-          "/dicom/functions/layer-count-function",
-          "/dicom/functions/aggregate-results-function"
-        ],
-        "WithDecryption": true
+        "Parameters.$": "States.ArrayUnique($.config.Parameters)"
       },
       "ResultPath": "$.config",
       "Next": "Convert DICOM to Image Layers"
@@ -26,18 +81,19 @@
       "Resource": "arn:aws:states:::ecs:runTask.sync",
       "Parameters": {
         "LaunchType": "FARGATE",
-        "TaskDefinition.$": "States.StringAt($.config.Parameters[?(@.Name == '/dicom/tasks/dicom-converter-task')].Value, '[0]')",
+        "Cluster.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/tasks/dicom-converter-cluster')].Value, 0)",
+        "TaskDefinition.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/tasks/dicom-converter-task')].Value, 0)",
         "NetworkConfiguration": {
           "AwsvpcConfiguration": {
-            "Subnets.$": "$.config.Parameters[?(@.Name == '/dicom/network/subnet-ids')].Value[0]",
-            "SecurityGroups.$": "$.config.Parameters[?(@.Name == '/dicom/network/security-group-id')].Value[0]",
+            "Subnets.$": "States.StringSplit(States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/network/subnet-ids')].Value, 0), ',')",
+            "SecurityGroups.$": "States.StringSplit(States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/network/security-group-id')].Value, 0), ',')",
             "AssignPublicIp": "DISABLED"
           }
         },
         "Overrides": {
           "ContainerOverrides": [
             {
-              "Name": "dicom-converter",
+              "Name.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/tasks/dicom-converter-container')].Value, 0)",
               "Environment": [
                 {
                   "Name": "INPUT_BUCKET_NAME",
@@ -49,7 +105,7 @@
                 },
                 {
                   "Name": "OUTPUT_BUCKET_NAME",
-                  "Value.$": "$.config.Parameters[?(@.Name == '/dicom/storage/output-bucket')].Value[0]"
+                  "Value.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/storage/output-bucket')].Value, 0)"
                 }
               ]
             }
@@ -63,9 +119,9 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName.$": "$.config.Parameters[?(@.Name == '/dicom/functions/layer-count-function')].Value[0]",
+        "FunctionName.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/functions/layer-count-function')].Value, 0)",
         "Payload": {
-          "outputBucket.$": "$.config.Parameters[?(@.Name == '/dicom/storage/output-bucket')].Value[0]",
+          "outputBucket.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/storage/output-bucket')].Value, 0)",
           "outputPrefix.$": "$.conversionResult.OutputPrefix"
         }
       },
@@ -85,22 +141,22 @@
             "Resource": "arn:aws:states:::ecs:runTask.sync",
             "Parameters": {
               "LaunchType": "FARGATE",
-              "TaskDefinition.$": "$.config.Parameters[?(@.Name == '/dicom/tasks/bedrock-inference-task')].Value[0]",
+              "TaskDefinition.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/tasks/bedrock-inference-task')].Value, 0)",
               "NetworkConfiguration": {
                 "AwsvpcConfiguration": {
-                  "Subnets.$": "$.config.Parameters[?(@.Name == '/dicom/network/subnet-ids')].Value[0]",
-                  "SecurityGroups.$": "$.config.Parameters[?(@.Name == '/dicom/network/security-group-id')].Value[0]",
+                  "Subnets.$": "States.StringSplit(States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/network/subnet-ids')].Value, 0), ',')",
+                  "SecurityGroups.$": "States.StringSplit(States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/network/security-group-id')].Value, 0), ',')",
                   "AssignPublicIp": "DISABLED"
                 }
               },
               "Overrides": {
                 "ContainerOverrides": [
                   {
-                    "Name": "bedrock-inference",
+                    "Name.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/tasks/bedrock-inference-container')].Value, 0)",
                     "Environment": [
                       {
                         "Name": "INPUT_BUCKET",
-                        "Value.$": "$.config.Parameters[?(@.Name == '/dicom/storage/output-bucket')].Value[0]"
+                        "Value.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/storage/output-bucket')].Value, 0)"
                       },
                       {
                         "Name": "INPUT_KEY",
@@ -108,7 +164,7 @@
                       },
                       {
                         "Name": "OUTPUT_BUCKET",
-                        "Value.$": "$.config.Parameters[?(@.Name == '/dicom/storage/inference-output-bucket')].Value[0]"
+                        "Value.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/storage/inference-output-bucket')].Value, 0)"
                       }
                     ]
                   }
@@ -125,9 +181,9 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName.$": "$.config.Parameters[?(@.Name == '/dicom/functions/aggregate-results-function')].Value[0]",
+        "FunctionName.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/functions/aggregate-results-function')].Value, 0)",
         "Payload": {
-          "inferenceBucket.$": "$.config.Parameters[?(@.Name == '/dicom/storage/inference-output-bucket')].Value[0]",
+          "inferenceBucket.$": "States.ArrayGetItem($.config.Parameters[?(@.Name == '/dicom/storage/inference-output-bucket')].Value, 0)",
           "inferencePrefix.$": "$.conversionResult.OutputPrefix"
         }
       },
